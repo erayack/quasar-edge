@@ -17,6 +17,7 @@ thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 serde_jcs = "0.1"
+dotenvy = "0.15"
 anyhow = "1"
 async-trait = "0.1"
 base64 = "0.22"

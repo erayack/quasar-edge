@@ -11,6 +11,14 @@ Auth-scoped WebSocket query gateway with cache + invalidation refetch.
 
 Out of scope: durable storage, eviction policies beyond subscription lifecycle, distributed coordination, and diff/patch updates.
 
+## Setup
+
+```bash
+cp .env.example .env
+```
+
+Edit `.env` to set `AUTH_JWT_SECRET` and any other overrides.
+
 ## Run
 
 ```bash

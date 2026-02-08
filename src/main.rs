@@ -2,7 +2,8 @@ use std::{net::SocketAddr, sync::Arc};
 
 use axum::{routing::get, Router};
 use tokio::sync::Semaphore;
-use tracing::{error, info};
+use tracing::{debug, error, info};
+use tracing_subscriber::EnvFilter;
 
 mod auth;
 mod cache;
@@ -54,10 +55,22 @@ impl AppState {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
+    init_tracing();
+    load_dotenv()?;
 
     let config = config::Config::from_env()?;
     let bind_addr = config.bind_addr.clone();
+
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        bind_addr = %config.bind_addr,
+        core_base_url = %config.core_base_url,
+        invalidation_stream_url = %config.invalidation_stream_url,
+        ws_send_buffer = config.ws_send_buffer,
+        refetch_concurrency = config.refetch_concurrency,
+        "starting quasar-edge"
+    );
+
     let state = AppState::initialize(config).await?;
 
     // start invalidation worker
@@ -90,4 +103,23 @@ async fn main() -> anyhow::Result<()> {
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
     info!("shutdown signal received");
+}
+
+fn init_tracing() {
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::fmt().with_env_filter(env_filter).init();
+}
+
+fn load_dotenv() -> anyhow::Result<()> {
+    match dotenvy::dotenv() {
+        Ok(path) => {
+            info!(path = %path.display(), "loaded .env");
+            Ok(())
+        }
+        Err(dotenvy::Error::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+            debug!("no .env file found; using process environment");
+            Ok(())
+        }
+        Err(err) => Err(err.into()),
+    }
 }
