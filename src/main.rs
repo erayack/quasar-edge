@@ -22,6 +22,8 @@ pub struct AppState {
     pub refetch_semaphore: Arc<Semaphore>,
     pub ws_send_buffer: usize,
     pub auth_secret: Arc<str>,
+    pub auth_validate_exp: bool,
+    pub invalidation_retry_backoff_ms: u64,
 }
 
 impl AppState {
@@ -32,6 +34,8 @@ impl AppState {
         let refetch_semaphore = Arc::new(Semaphore::new(config.refetch_concurrency));
         let ws_send_buffer = config.ws_send_buffer;
         let auth_secret: Arc<str> = Arc::from(config.auth_secret.as_str());
+        let auth_validate_exp = config.auth_validate_exp;
+        let invalidation_retry_backoff_ms = config.invalidation_retry_backoff_ms;
         let core_client = Arc::new(core_client::HttpCoreClient::new(config.clone())?);
 
         Ok(Arc::new(Self {
@@ -42,6 +46,8 @@ impl AppState {
             refetch_semaphore,
             ws_send_buffer,
             auth_secret,
+            auth_validate_exp,
+            invalidation_retry_backoff_ms,
         }))
     }
 }

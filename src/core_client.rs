@@ -93,11 +93,17 @@ fn async_stream(
     use tokio::io::AsyncBufReadExt;
 
     let stream = futures::stream::once(async move {
-        let resp = client.get(&url).send().await.map_err(CoreError::Http)?;
+        let resp = client
+            .get(&url)
+            .send()
+            .await
+            .map_err(CoreError::Http)?
+            .error_for_status()
+            .map_err(CoreError::Http)?;
         let byte_stream = resp.bytes_stream();
 
         let reader = tokio_util::io::StreamReader::new(
-            byte_stream.map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))),
+            byte_stream.map(|r| r.map_err(std::io::Error::other)),
         );
         let lines = tokio::io::BufReader::new(reader).lines();
         Ok::<_, CoreError>(LinesStream::new(lines))

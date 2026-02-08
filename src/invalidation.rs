@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use futures::StreamExt;
+use futures::{stream, StreamExt};
 use serde_json::Value;
 use tracing::{debug, error, info, warn};
 
@@ -23,7 +23,11 @@ pub async fn run_invalidation_loop(state: Arc<AppState>, core: Arc<dyn CoreClien
             };
 
             let decision = state.ordering.classify(event.version);
-            debug!(version = event.version, ?decision, "classified invalidation event");
+            debug!(
+                version = event.version,
+                ?decision,
+                "classified invalidation event"
+            );
 
             match decision {
                 ApplyDecision::DropOld => {
@@ -40,7 +44,10 @@ pub async fn run_invalidation_loop(state: Arc<AppState>, core: Arc<dyn CoreClien
         }
 
         warn!("invalidation stream ended; retrying after backoff");
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(
+            state.invalidation_retry_backoff_ms,
+        ))
+        .await;
     }
 }
 
@@ -61,15 +68,19 @@ async fn handle_gap_recovery(
     new_watermark: u64,
 ) {
     let all_keys = state.subscriptions.subscribed_keys();
-    info!(key_count = all_keys.len(), "gap recovery: refetching all subscribed keys");
+    info!(
+        key_count = all_keys.len(),
+        "gap recovery: refetching all subscribed keys"
+    );
 
     for key in &all_keys {
         state.cache.mark_stale_by_query_id(&key.query_id);
     }
 
-    refetch_keys(state, core, &all_keys).await;
-
-    state.ordering.reset();
+    let failures = refetch_keys(state, core, &all_keys).await;
+    if failures > 0 {
+        warn!(failures, "gap recovery finished with refetch failures");
+    }
     state.ordering.set(new_watermark);
 }
 
@@ -77,43 +88,33 @@ async fn refetch_keys(
     state: &Arc<AppState>,
     core: &Arc<dyn CoreClient>,
     keys: &[QueryCacheKey],
-) {
-    let mut handles = Vec::with_capacity(keys.len());
-
-    for key in keys {
-        let state = state.clone();
-        let core = core.clone();
-        let key = key.clone();
-
-        let handle = tokio::spawn(async move {
-            let _permit = state.refetch_semaphore.acquire().await;
-            refetch_single(&state, &core, &key).await;
-        });
-
-        handles.push(handle);
-    }
-
-    for handle in handles {
-        if let Err(e) = handle.await {
-            error!(error = %e, "refetch task panicked");
-        }
-    }
+) -> usize {
+    let concurrency = state.refetch_semaphore.available_permits().max(1);
+    stream::iter(keys.iter().cloned())
+        .map(|key| {
+            let state = state.clone();
+            let core = core.clone();
+            async move { refetch_single(&state, &core, &key).await }
+        })
+        .buffer_unordered(concurrency)
+        .filter(|ok| futures::future::ready(!ok))
+        .count()
+        .await
 }
 
-async fn refetch_single(
-    state: &AppState,
-    core: &Arc<dyn CoreClient>,
-    key: &QueryCacheKey,
-) {
+async fn refetch_single(state: &AppState, core: &Arc<dyn CoreClient>, key: &QueryCacheKey) -> bool {
     let result: Result<(), CoreError> = state
         .cache
         .with_refresh_lock(key, || async {
-            let args: Value =
-                serde_json::from_str(&key.args_canonical).unwrap_or(Value::Null);
+            let _permit = state
+                .refetch_semaphore
+                .acquire()
+                .await
+                .map_err(|e| CoreError::Stream(format!("semaphore closed: {e}")))?;
 
-            let (version, payload) = core
-                .fetch_query(&key.auth, &key.query_id, &args)
-                .await?;
+            let args = decode_args(&key.args_canonical)?;
+
+            let (version, payload) = core.fetch_query(&key.auth, &key.query_id, &args).await?;
 
             let entry = CacheEntry {
                 result: payload.clone(),
@@ -127,7 +128,10 @@ async fn refetch_single(
                 query_id: key.query_id.to_string(),
                 payload,
             };
-            state.subscriptions.fan_out_snapshot(key, &msg);
+            let orphaned = state.subscriptions.fan_out_snapshot(key, &msg);
+            for orphan in orphaned {
+                state.cache.remove(&orphan);
+            }
 
             Ok(())
         })
@@ -135,5 +139,11 @@ async fn refetch_single(
 
     if let Err(e) = result {
         warn!(query_id = %key.query_id, error = %e, "failed to refetch query");
+        return false;
     }
+    true
+}
+
+fn decode_args(args_canonical: &str) -> Result<Value, CoreError> {
+    serde_json::from_str(args_canonical).map_err(CoreError::Deserialization)
 }

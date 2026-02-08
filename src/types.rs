@@ -32,6 +32,11 @@ pub enum ClientMsg {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientInitMsg {
+    pub token: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ServerMsg {
     Snapshot { query_id: String, payload: Value },
     Error { message: String },

@@ -16,7 +16,7 @@ use uuid::Uuid;
 use crate::{
     auth,
     subscriptions::ConnectionId,
-    types::{AuthContextKey, CacheEntry, ClientMsg, QueryCacheKey, ServerMsg},
+    types::{AuthContextKey, CacheEntry, ClientInitMsg, ClientMsg, QueryCacheKey, ServerMsg},
     AppState,
 };
 
@@ -33,32 +33,23 @@ async fn handle_connection(socket: WebSocket, state: Arc<AppState>) {
     let first_msg = match ws_stream.next().await {
         Some(Ok(Message::Text(text))) => text,
         _ => {
-            let _ = ws_sink
-                .send(Message::Text(
-                    serde_json::to_string(&ServerMsg::Error {
-                        message: "expected auth message".into(),
-                    })
-                    .unwrap()
-                    .into(),
-                ))
-                .await;
+            let text = serialize_server_msg(&ServerMsg::Error {
+                message: "expected init message".into(),
+            });
+            let _ = ws_sink.send(Message::Text(text)).await;
             return;
         }
     };
 
-    let auth_key = match extract_auth_from_init(&first_msg, &state.auth_secret) {
-        Ok(key) => key,
-        Err(msg) => {
-            let _ = ws_sink
-                .send(Message::Text(
-                    serde_json::to_string(&ServerMsg::Error { message: msg })
-                        .unwrap()
-                        .into(),
-                ))
-                .await;
-            return;
-        }
-    };
+    let auth_key =
+        match extract_auth_from_init(&first_msg, &state.auth_secret, state.auth_validate_exp) {
+            Ok(key) => key,
+            Err(msg) => {
+                let text = serialize_server_msg(&ServerMsg::Error { message: msg });
+                let _ = ws_sink.send(Message::Text(text)).await;
+                return;
+            }
+        };
 
     let connection_id: ConnectionId = Uuid::new_v4();
     let (tx, mut rx) = mpsc::channel::<ServerMsg>(state.ws_send_buffer);
@@ -78,7 +69,7 @@ async fn handle_connection(socket: WebSocket, state: Arc<AppState>) {
                     continue;
                 }
             };
-            if ws_sink.send(Message::Text(text.into())).await.is_err() {
+            if ws_sink.send(Message::Text(text)).await.is_err() {
                 break;
             }
         }
@@ -105,35 +96,41 @@ async fn handle_connection(socket: WebSocket, state: Arc<AppState>) {
 
         match client_msg {
             ClientMsg::Subscribe { query_id, args } => {
-                handle_subscribe(
-                    &state,
-                    connection_id,
-                    &auth_key,
-                    &query_id,
-                    &args,
-                    &tx,
-                )
-                .await;
+                handle_subscribe(&state, connection_id, &auth_key, &query_id, &args, &tx).await;
             }
             ClientMsg::Unsubscribe { query_id, args } => {
-                let key = build_cache_key(&query_id, &args, &auth_key);
-                state.subscriptions.unsubscribe(&connection_id, &key);
+                match build_cache_key(&query_id, &args, &auth_key) {
+                    Ok(key) => {
+                        if state.subscriptions.unsubscribe(&connection_id, &key) {
+                            state.cache.remove(&key);
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx
+                            .send(ServerMsg::Error {
+                                message: format!("invalid unsubscribe args: {e}"),
+                            })
+                            .await;
+                    }
+                }
             }
         }
     }
 
-    state.subscriptions.unregister_connection(&connection_id);
+    let orphaned = state.subscriptions.unregister_connection(&connection_id);
+    for key in orphaned {
+        state.cache.remove(&key);
+    }
     send_task.abort();
     info!(%connection_id, "ws disconnected");
 }
 
-fn extract_auth_from_init(text: &str, secret: &str) -> Result<AuthContextKey, String> {
-    #[derive(serde::Deserialize)]
-    struct InitMsg {
-        token: String,
-    }
-
-    let init: InitMsg =
+fn extract_auth_from_init(
+    text: &str,
+    secret: &str,
+    validate_exp: bool,
+) -> Result<AuthContextKey, String> {
+    let init: ClientInitMsg =
         serde_json::from_str(text).map_err(|e| format!("invalid init message: {e}"))?;
 
     let mut headers = axum::http::HeaderMap::new();
@@ -144,7 +141,7 @@ fn extract_auth_from_init(text: &str, secret: &str) -> Result<AuthContextKey, St
             .map_err(|_| "invalid token value".to_string())?,
     );
 
-    auth::auth_context_key(&headers, secret).map_err(|e| format!("auth failed: {e}"))
+    auth::auth_context_key(&headers, secret, validate_exp).map_err(|e| format!("auth failed: {e}"))
 }
 
 async fn handle_subscribe(
@@ -155,11 +152,19 @@ async fn handle_subscribe(
     args: &Value,
     tx: &mpsc::Sender<ServerMsg>,
 ) {
-    let key = build_cache_key(query_id, args, auth_key);
+    let key = match build_cache_key(query_id, args, auth_key) {
+        Ok(key) => key,
+        Err(e) => {
+            let _ = tx
+                .send(ServerMsg::Error {
+                    message: format!("invalid subscribe args: {e}"),
+                })
+                .await;
+            return;
+        }
+    };
 
-    state
-        .subscriptions
-        .subscribe(connection_id, key.clone());
+    state.subscriptions.subscribe(connection_id, key.clone());
 
     match resolve_snapshot(state, &key, auth_key, query_id, args).await {
         Ok(entry) => {
@@ -172,6 +177,9 @@ async fn handle_subscribe(
             }
         }
         Err(e) => {
+            if state.subscriptions.unsubscribe(&connection_id, &key) {
+                state.cache.remove(&key);
+            }
             let _ = tx
                 .send(ServerMsg::Error {
                     message: format!("fetch failed: {e}"),
@@ -251,13 +259,32 @@ async fn fetch_and_cache(
         .await
 }
 
-fn build_cache_key(query_id: &str, args: &Value, auth_key: &AuthContextKey) -> QueryCacheKey {
-    let args_canonical =
-        serde_jcs::to_string(args).unwrap_or_else(|_| serde_json::to_string(args).unwrap());
+fn build_cache_key(
+    query_id: &str,
+    args: &Value,
+    auth_key: &AuthContextKey,
+) -> Result<QueryCacheKey, String> {
+    let args_canonical = match serde_jcs::to_string(args) {
+        Ok(v) => v,
+        Err(_) => {
+            serde_json::to_string(args).map_err(|e| format!("args serialization failed: {e}"))?
+        }
+    };
 
-    QueryCacheKey {
+    Ok(QueryCacheKey {
         query_id: Arc::from(query_id),
         args_canonical: Arc::from(args_canonical.as_str()),
         auth: auth_key.clone(),
-    }
+    })
+}
+
+fn serialize_server_msg(msg: &ServerMsg) -> String {
+    serde_json::to_string(msg).unwrap_or_else(|e| {
+        serde_json::json!({
+            "Error": {
+                "message": format!("server serialization error: {e}")
+            }
+        })
+        .to_string()
+    })
 }

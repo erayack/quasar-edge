@@ -13,7 +13,11 @@ pub enum AuthError {
     Verification(String),
 }
 
-pub fn auth_context_key(headers: &HeaderMap, secret: &str) -> Result<AuthContextKey, AuthError> {
+pub fn auth_context_key(
+    headers: &HeaderMap,
+    secret: &str,
+    validate_exp: bool,
+) -> Result<AuthContextKey, AuthError> {
     let value = headers
         .get("authorization")
         .ok_or(AuthError::MissingHeader)?
@@ -24,7 +28,7 @@ pub fn auth_context_key(headers: &HeaderMap, secret: &str) -> Result<AuthContext
         .strip_prefix("Bearer ")
         .ok_or_else(|| AuthError::Invalid("expected Bearer scheme".into()))?;
 
-    let user_id = decode_user_id(token, secret)?;
+    let user_id = decode_user_id(token, secret, validate_exp)?;
 
     if user_id.is_empty() {
         return Err(AuthError::Invalid("empty user_id".into()));
@@ -38,11 +42,11 @@ struct Claims {
     sub: String,
 }
 
-fn decode_user_id(token: &str, secret: &str) -> Result<String, AuthError> {
+fn decode_user_id(token: &str, secret: &str, validate_exp: bool) -> Result<String, AuthError> {
     use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 
     let mut validation = Validation::new(Algorithm::HS256);
-    validation.validate_exp = false; // PoC: caller can add exp later
+    validation.validate_exp = validate_exp;
     let data = decode::<Claims>(
         token,
         &DecodingKey::from_secret(secret.as_bytes()),

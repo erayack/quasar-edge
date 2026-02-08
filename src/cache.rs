@@ -71,11 +71,7 @@ impl AuthScopedCache {
         stale_keys
     }
 
-    pub async fn with_refresh_lock<F, Fut, T, E>(
-        &self,
-        key: &QueryCacheKey,
-        f: F,
-    ) -> Result<T, E>
+    pub async fn with_refresh_lock<F, Fut, T, E>(&self, key: &QueryCacheKey, f: F) -> Result<T, E>
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<T, E>>,
