@@ -36,7 +36,7 @@ impl AppState {
         let auth_secret: Arc<str> = Arc::from(config.auth_secret.as_str());
         let auth_validate_exp = config.auth_validate_exp;
         let invalidation_retry_backoff_ms = config.invalidation_retry_backoff_ms;
-        let core_client = Arc::new(core_client::HttpCoreClient::new(config.clone())?);
+        let core_client = Arc::new(core_client::HttpCoreClient::new(config)?);
 
         Ok(Arc::new(Self {
             cache,

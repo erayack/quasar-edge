@@ -15,10 +15,29 @@ use uuid::Uuid;
 
 use crate::{
     auth,
+    core_client::CoreError,
     subscriptions::ConnectionId,
     types::{AuthContextKey, CacheEntry, ClientInitMsg, ClientMsg, QueryCacheKey, ServerMsg},
     AppState,
 };
+
+#[derive(Debug, thiserror::Error)]
+enum WsGatewayError {
+    #[error("invalid init message: {0}")]
+    InvalidInitMessage(#[from] serde_json::Error),
+    #[error("invalid token value")]
+    InvalidTokenValue,
+    #[error("auth failed: {0}")]
+    Auth(#[from] auth::AuthError),
+    #[error("args serialization failed: {0}")]
+    ArgsSerialization(serde_json::Error),
+    #[error("invalid canonical args: {0}")]
+    InvalidCanonicalArgs(serde_json::Error),
+    #[error("semaphore closed: {0}")]
+    SemaphoreClosed(String),
+    #[error("core fetch error: {0}")]
+    CoreFetch(#[from] CoreError),
+}
 
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
@@ -44,8 +63,10 @@ async fn handle_connection(socket: WebSocket, state: Arc<AppState>) {
     let auth_key =
         match extract_auth_from_init(&first_msg, &state.auth_secret, state.auth_validate_exp) {
             Ok(key) => key,
-            Err(msg) => {
-                let text = serialize_server_msg(&ServerMsg::Error { message: msg });
+            Err(e) => {
+                let text = serialize_server_msg(&ServerMsg::Error {
+                    message: e.to_string(),
+                });
                 let _ = ws_sink.send(Message::Text(text)).await;
                 return;
             }
@@ -129,19 +150,18 @@ fn extract_auth_from_init(
     text: &str,
     secret: &str,
     validate_exp: bool,
-) -> Result<AuthContextKey, String> {
-    let init: ClientInitMsg =
-        serde_json::from_str(text).map_err(|e| format!("invalid init message: {e}"))?;
+) -> Result<AuthContextKey, WsGatewayError> {
+    let init: ClientInitMsg = serde_json::from_str(text)?;
 
     let mut headers = axum::http::HeaderMap::new();
     headers.insert(
         "authorization",
         format!("Bearer {}", init.token)
             .parse()
-            .map_err(|_| "invalid token value".to_string())?,
+            .map_err(|_| WsGatewayError::InvalidTokenValue)?,
     );
 
-    auth::auth_context_key(&headers, secret, validate_exp).map_err(|e| format!("auth failed: {e}"))
+    Ok(auth::auth_context_key(&headers, secret, validate_exp)?)
 }
 
 async fn handle_subscribe(
@@ -166,7 +186,7 @@ async fn handle_subscribe(
 
     state.subscriptions.subscribe(connection_id, key.clone());
 
-    match resolve_snapshot(state, &key, auth_key, query_id, args).await {
+    match resolve_snapshot(state, &key).await {
         Ok(entry) => {
             let msg = ServerMsg::Snapshot {
                 query_id: query_id.to_string(),
@@ -192,41 +212,29 @@ async fn handle_subscribe(
 async fn resolve_snapshot(
     state: &Arc<AppState>,
     key: &QueryCacheKey,
-    auth_key: &AuthContextKey,
-    query_id: &str,
-    args: &Value,
-) -> Result<CacheEntry, String> {
+) -> Result<CacheEntry, WsGatewayError> {
     if let Some(entry) = state.cache.get(key).await {
         if !entry.stale {
-            debug!(query_id, "serving from cache");
+            debug!(query_id = %key.query_id, "serving from cache");
             return Ok(entry);
         }
     }
 
-    fetch_and_cache(state, key, auth_key, query_id, args).await
+    fetch_and_cache(state, key).await
 }
 
 async fn fetch_and_cache(
     state: &Arc<AppState>,
     key: &QueryCacheKey,
-    auth_key: &AuthContextKey,
-    query_id: &str,
-    args: &Value,
-) -> Result<CacheEntry, String> {
+) -> Result<CacheEntry, WsGatewayError> {
     let state = state.clone();
     let key = key.clone();
-    let auth_key = auth_key.clone();
-    let query_id = query_id.to_string();
-    let args = args.clone();
 
     state
         .cache
         .with_refresh_lock(&key, || {
             let state = state.clone();
             let key = key.clone();
-            let auth_key = auth_key.clone();
-            let query_id = query_id.clone();
-            let args = args.clone();
             async move {
                 if let Some(entry) = state.cache.get(&key).await {
                     if !entry.stale {
@@ -238,13 +246,16 @@ async fn fetch_and_cache(
                     .refetch_semaphore
                     .acquire()
                     .await
-                    .map_err(|e| format!("semaphore closed: {e}"))?;
+                    .map_err(|e| WsGatewayError::SemaphoreClosed(e.to_string()))?;
+
+                let args: Value = serde_json::from_str(&key.args_canonical)
+                    .map_err(WsGatewayError::InvalidCanonicalArgs)?;
 
                 let (version, result) = state
                     .core_client
-                    .fetch_query(&auth_key, &query_id, &args)
+                    .fetch_query(&key.auth, &key.query_id, &args)
                     .await
-                    .map_err(|e| format!("core fetch error: {e}"))?;
+                    .map_err(WsGatewayError::CoreFetch)?;
 
                 let entry = CacheEntry {
                     result,
@@ -263,13 +274,10 @@ fn build_cache_key(
     query_id: &str,
     args: &Value,
     auth_key: &AuthContextKey,
-) -> Result<QueryCacheKey, String> {
-    let args_canonical = match serde_jcs::to_string(args) {
-        Ok(v) => v,
-        Err(_) => {
-            serde_json::to_string(args).map_err(|e| format!("args serialization failed: {e}"))?
-        }
-    };
+) -> Result<QueryCacheKey, WsGatewayError> {
+    let args_canonical = serde_jcs::to_string(args)
+        .or_else(|_| serde_json::to_string(args))
+        .map_err(WsGatewayError::ArgsSerialization)?;
 
     Ok(QueryCacheKey {
         query_id: Arc::from(query_id),

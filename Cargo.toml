@@ -22,3 +22,8 @@ async-trait = "0.1"
 base64 = "0.22"
 tokio-util = { version = "0.7", features = ["io"] }
 jsonwebtoken = "9"
+
+[lints.clippy]
+redundant_clone = "warn"
+manual_ok_or = "warn"
+needless_collect = "warn"
