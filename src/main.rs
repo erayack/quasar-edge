@@ -21,6 +21,7 @@ pub struct AppState {
     pub core_client: Arc<dyn core_client::CoreClient>,
     pub refetch_semaphore: Arc<Semaphore>,
     pub ws_send_buffer: usize,
+    pub auth_secret: Arc<str>,
 }
 
 impl AppState {
@@ -30,6 +31,7 @@ impl AppState {
         let ordering = ordering::OrderingGuard::new();
         let refetch_semaphore = Arc::new(Semaphore::new(config.refetch_concurrency));
         let ws_send_buffer = config.ws_send_buffer;
+        let auth_secret: Arc<str> = Arc::from(config.auth_secret.as_str());
         let core_client = Arc::new(core_client::HttpCoreClient::new(config.clone())?);
 
         Ok(Arc::new(Self {
@@ -39,6 +41,7 @@ impl AppState {
             core_client,
             refetch_semaphore,
             ws_send_buffer,
+            auth_secret,
         }))
     }
 }

@@ -46,7 +46,7 @@ async fn handle_connection(socket: WebSocket, state: Arc<AppState>) {
         }
     };
 
-    let auth_key = match extract_auth_from_init(&first_msg) {
+    let auth_key = match extract_auth_from_init(&first_msg, &state.auth_secret) {
         Ok(key) => key,
         Err(msg) => {
             let _ = ws_sink
@@ -127,7 +127,7 @@ async fn handle_connection(socket: WebSocket, state: Arc<AppState>) {
     info!(%connection_id, "ws disconnected");
 }
 
-fn extract_auth_from_init(text: &str) -> Result<AuthContextKey, String> {
+fn extract_auth_from_init(text: &str, secret: &str) -> Result<AuthContextKey, String> {
     #[derive(serde::Deserialize)]
     struct InitMsg {
         token: String,
@@ -144,7 +144,7 @@ fn extract_auth_from_init(text: &str) -> Result<AuthContextKey, String> {
             .map_err(|_| "invalid token value".to_string())?,
     );
 
-    auth::auth_context_key(&headers).map_err(|e| format!("auth failed: {e}"))
+    auth::auth_context_key(&headers, secret).map_err(|e| format!("auth failed: {e}"))
 }
 
 async fn handle_subscribe(

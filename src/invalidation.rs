@@ -10,35 +10,38 @@ use crate::types::{CacheEntry, QueryCacheKey, ServerMsg};
 use crate::AppState;
 
 pub async fn run_invalidation_loop(state: Arc<AppState>, core: Arc<dyn CoreClient>) {
-    let mut stream = core.invalidation_stream();
+    loop {
+        let mut stream = core.invalidation_stream();
 
-    while let Some(result) = stream.next().await {
-        let event = match result {
-            Ok(ev) => ev,
-            Err(e) => {
-                error!(error = %e, "invalidation stream error");
-                continue;
-            }
-        };
+        while let Some(result) = stream.next().await {
+            let event = match result {
+                Ok(ev) => ev,
+                Err(e) => {
+                    error!(error = %e, "invalidation stream error");
+                    continue;
+                }
+            };
 
-        let decision = state.ordering.classify(event.version);
-        debug!(version = event.version, ?decision, "classified invalidation event");
+            let decision = state.ordering.classify(event.version);
+            debug!(version = event.version, ?decision, "classified invalidation event");
 
-        match decision {
-            ApplyDecision::DropOld => {
-                debug!(version = event.version, "dropping old event");
-            }
-            ApplyDecision::ApplyInOrder => {
-                apply_invalidation(&state, &core, &event.affected_query_ids).await;
-            }
-            ApplyDecision::GapDetected { expected, got } => {
-                warn!(expected, got, "gap detected, performing full recovery");
-                handle_gap_recovery(&state, &core, got).await;
+            match decision {
+                ApplyDecision::DropOld => {
+                    debug!(version = event.version, "dropping old event");
+                }
+                ApplyDecision::ApplyInOrder => {
+                    apply_invalidation(&state, &core, &event.affected_query_ids).await;
+                }
+                ApplyDecision::GapDetected { expected, got } => {
+                    warn!(expected, got, "gap detected, performing full recovery");
+                    handle_gap_recovery(&state, &core, got).await;
+                }
             }
         }
-    }
 
-    warn!("invalidation stream ended");
+        warn!("invalidation stream ended; retrying after backoff");
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    }
 }
 
 async fn apply_invalidation(
@@ -67,7 +70,7 @@ async fn handle_gap_recovery(
     refetch_keys(state, core, &all_keys).await;
 
     state.ordering.reset();
-    state.ordering.classify(new_watermark);
+    state.ordering.set(new_watermark);
 }
 
 async fn refetch_keys(

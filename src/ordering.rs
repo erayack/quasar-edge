@@ -55,6 +55,11 @@ impl OrderingGuard {
     pub fn reset(&self) {
         self.last_applied.store(0, Ordering::SeqCst);
     }
+
+    /// Force the watermark to a specific value (used after recovery paths).
+    pub fn set(&self, value: u64) {
+        self.last_applied.store(value, Ordering::SeqCst);
+    }
 }
 
 impl Default for OrderingGuard {
@@ -105,5 +110,16 @@ mod tests {
         guard.reset();
         assert_eq!(guard.last(), 0);
         assert_eq!(guard.classify(1), ApplyDecision::ApplyInOrder);
+    }
+
+    #[test]
+    fn set_allows_advancing_after_gap() {
+        let guard = OrderingGuard::new();
+        assert_eq!(guard.classify(1), ApplyDecision::ApplyInOrder);
+        // Simulate recovery that jumps watermark forward
+        guard.set(5);
+        assert_eq!(guard.last(), 5);
+        // Next event should apply in order
+        assert_eq!(guard.classify(6), ApplyDecision::ApplyInOrder);
     }
 }
